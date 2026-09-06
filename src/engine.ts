@@ -7,10 +7,14 @@ import {
   AuditVerificationResult
 } from './types';
 import { VaultCrypto } from './crypto';
+import { TemporalIndex } from './index_engine';
+import { VaultCompactor, CompactionReport } from './compactor';
 
 export class ChronoVault {
   private records: Map<string, TemporalRecord[]> = new Map();
   private auditJournal: TemporalRecord[] = [];
+  private recordMap: Map<string, TemporalRecord> = new Map();
+  private timeIndex: TemporalIndex = new TemporalIndex();
   private crypto: VaultCrypto;
   private config: TemporalConfig;
   private lastHmac: string = '0000000000000000000000000000000000000000000000000000000000000000';
@@ -43,8 +47,9 @@ export class ChronoVault {
     const previousHmac = this.lastHmac;
     this.lastHmac = currentHmac;
 
+    const id = randomUUID();
     const record: TemporalRecord<any> = {
-      id: randomUUID(),
+      id,
       key,
       value: storedValue,
       timestamp,
@@ -59,6 +64,8 @@ export class ChronoVault {
     history.push(record);
     this.records.set(key, history);
     this.auditJournal.push(record);
+    this.recordMap.set(id, record);
+    this.timeIndex.insert(timestamp, id);
 
     return {
       ...record,
@@ -77,7 +84,6 @@ export class ChronoVault {
     const history = this.records.get(key);
     if (!history || history.length === 0) return null;
 
-    // Find the newest version whose timestamp <= target timestamp
     let matched: TemporalRecord | null = null;
     for (let i = history.length - 1; i >= 0; i--) {
       if (history[i].timestamp <= timestamp) {
@@ -99,6 +105,18 @@ export class ChronoVault {
     }));
   }
 
+  public findBetween(startTime: number, endTime: number): Array<{ key: string; timestamp: number; version: number }> {
+    const ids = this.timeIndex.findRange(startTime, endTime);
+    return ids.map((id) => {
+      const rec = this.recordMap.get(id)!;
+      return {
+        key: rec.key,
+        timestamp: rec.timestamp,
+        version: rec.version
+      };
+    });
+  }
+
   public diff<T>(key: string, t1: number, t2: number): TemporalDiff<T> {
     const [earlyTime, lateTime] = t1 <= t2 ? [t1, t2] : [t2, t1];
     const valEarly = this.getAt<T>(key, earlyTime);
@@ -116,6 +134,10 @@ export class ChronoVault {
       newValue: valLate,
       versionDelta: Math.max(0, vLate - vEarly)
     };
+  }
+
+  public compact(maxAgeMs?: number, minSnapshotsRetained: number = 1): CompactionReport {
+    return VaultCompactor.compact(this.records, maxAgeMs, minSnapshotsRetained);
   }
 
   public verifyIntegrity(): AuditVerificationResult {
